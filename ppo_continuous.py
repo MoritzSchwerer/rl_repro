@@ -4,6 +4,8 @@ import gymnasium as gym
 import tyro
 import torch
 import torch.nn as nn
+import time
+
 from datetime import datetime
 from dataclasses import dataclass
 from torch.distributions import Normal
@@ -150,7 +152,7 @@ def make_env(env_id: str, render_video: bool = False):
 
 
 class PPO:
-    def __init__(self, env, args):
+    def __init__(self, env, args) -> None:
         self.env = env
         self.args: PPOArgs = args
 
@@ -178,6 +180,7 @@ class PPO:
 
     def train(self) -> None:
         self.global_step = 0
+        self.start_time = time.time()
         for it in range(self.args.num_iter):
             if self.args.anneal_lr:
                 frac = 1.0 - it / self.args.num_iter
@@ -366,6 +369,8 @@ class PPO:
         self.logger.add_scalar(
             "Loss/explained_variance", explained_var, self.global_step
         )
+        print("SPS: ", int(self.global_step / (time.time() - self.start_time)))
+        self.logger.add_scalar("Stats/StepsPerSecond", int(self.global_step / (time.time() - self.start_time)), self.global_step)
 
 
 class Agent(nn.Module):
