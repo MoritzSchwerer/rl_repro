@@ -1,18 +1,15 @@
 import math
-from typing import Dict
-
 import numpy as np
 import gymnasium as gym
 import tyro
 import torch
 import torch.nn as nn
-from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
 from torch.distributions import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-from utils import ReplayBuffer, log_model_gradients
+from utils import ReplayBuffer
 
 
 @dataclass
@@ -157,7 +154,7 @@ class PPO:
         self.env = env
         self.args: PPOArgs = args
 
-        self.agent = Agent(self.env, self.args.agent)
+        self.agent = Agent(self.env, self.args.agent).to(self.args.device)
         self.optim = torch.optim.Adam(
             self.agent.parameters(), lr=self.args.lr, eps=1e-5
         )
@@ -172,6 +169,7 @@ class PPO:
             (self.act_dim,),
             gamma=self.args.gamma,
             lmda=self.args.lambda_,
+            device=self.args.device,
         )
         now = datetime.now().strftime("%m_%d-%H:%M")
         self.logger = SummaryWriter(
@@ -184,48 +182,45 @@ class PPO:
             if self.args.anneal_lr:
                 frac = 1.0 - it / self.args.num_iter
                 self.optim.param_groups[0]["lr"] = self.args.lr * frac
-            self.logger.add_scalar("Loss/lr", self.optim.param_groups[0]["lr"], it)
 
             _ = self.collect_data()
-            assert self.rollout_buffer.is_full(), (
-                "RolloutBuffer should be full at this point"
-            )
+            assert (
+                self.rollout_buffer.is_full()
+            ), "RolloutBuffer should be full at this point"
 
-            stats = self.update()
-            self.logger.add_scalar("Loss/total", stats["loss"], it)
-            self.logger.add_scalar("Loss/actor", stats["loss_actor"], it)
-            self.logger.add_scalar("Loss/critic", stats["loss_critic"], it)
-            self.logger.add_scalar("Loss/entropy", stats["loss_entropy"], it)
-            self.logger.add_scalar(
-                "Stats/std",
-                self.agent.actor_logstd.flatten().exp().mean().item(),
-                self.global_step,
-            )
-            log_model_gradients(self.logger, self.agent.actor_mean, "Actor", it)
-            log_model_gradients(self.logger, self.agent.critic, "Critic", it)
-            self.logger.add_scalar("Stats/clipfrac", stats["clipfrac"], it)
+            _ = self.update()
         self.logger.close()
 
-    def collect_data(self) -> Dict[str, float]:
+    def collect_data(self):
         self.rollout_buffer.clear()
         # initialize the buffers for target calculations
         observations_t = torch.zeros(
-            (self.args.time_horizon, self.args.num_envs, self.obs_dim)
+            (self.args.time_horizon, self.args.num_envs, self.obs_dim),
+            device=self.args.device,
         )
-        rewards_t = torch.zeros((self.args.time_horizon, self.args.num_envs))
+        rewards_t = torch.zeros(
+            (self.args.time_horizon, self.args.num_envs), device=self.args.device
+        )
         actions_t = torch.zeros(
-            (self.args.time_horizon, self.args.num_envs, self.act_dim)
+            (self.args.time_horizon, self.args.num_envs, self.act_dim),
+            device=self.args.device,
         )
         dones_t = torch.zeros(
-            (self.args.time_horizon, self.args.num_envs), dtype=torch.bool
+            (self.args.time_horizon, self.args.num_envs),
+            dtype=torch.bool,
+            device=self.args.device,
         )
-        values_t = torch.zeros((self.args.time_horizon, self.args.num_envs))
-        log_probs_t = torch.zeros((self.args.time_horizon, self.args.num_envs))
+        values_t = torch.zeros(
+            (self.args.time_horizon, self.args.num_envs), device=self.args.device
+        )
+        log_probs_t = torch.zeros(
+            (self.args.time_horizon, self.args.num_envs), device=self.args.device
+        )
 
         # collect observations
         next_obs, info = self.env.reset()
-        next_obs = torch.from_numpy(next_obs)
-        next_dones = torch.zeros(self.args.num_envs)
+        next_obs = torch.from_numpy(next_obs).to(self.args.device)
+        next_dones = torch.zeros(self.args.num_envs, device=self.args.device)
         # s0, a0, d0 -> s1, r0, d1
         for t in range(self.args.time_horizon):
             self.global_step += self.args.num_envs
@@ -244,10 +239,10 @@ class PPO:
             actions = actions.squeeze(0).cpu().numpy()
             next_obs, rewards, truncated, terminated, info = self.env.step([actions])
             next_obs, rewards, terminated, truncated = (
-                torch.from_numpy(next_obs),
-                torch.from_numpy(np.array(rewards)),
-                torch.from_numpy(np.array(terminated)),
-                torch.from_numpy(np.array(truncated)),
+                torch.from_numpy(next_obs).to(self.args.device),
+                torch.from_numpy(np.array(rewards)).to(self.args.device),
+                torch.from_numpy(np.array(terminated)).to(self.args.device),
+                torch.from_numpy(np.array(truncated)).to(self.args.device),
             )
 
             next_dones = torch.logical_or(terminated, truncated).float()
@@ -276,40 +271,20 @@ class PPO:
         )
         future_values = self.agent.get_value(next_obs)
         self.rollout_buffer.compute_rewards_and_advantages(future_values, next_dones)
-        return {}
+        return
 
-    def update(self) -> Dict[str, float]:
-        losses = []
-        actor_losses = []
-        critic_losses = []
-        entropy_losses = []
-        num_clipped = 0
-
-        self.logger.add_histogram(
-            "Debug/advantages",
-            self.rollout_buffer.advantages.flatten(),
-            self.global_step,
-        )
-        self.logger.add_histogram(
-            "Debug/returns", self.rollout_buffer.returns.flatten(), self.global_step
-        )
-        self.logger.add_histogram(
-            "Debug/old_values", self.rollout_buffer.values.flatten(), self.global_step
-        )
-        self.logger.add_histogram(
-            "Debug/actions", self.rollout_buffer.actions.flatten(), self.global_step
-        )
+    def update(self):
+        clip_fracs = []
         for step in range(self.args.num_epochs):
             for batch in self.rollout_buffer.batches(
                 self.args.batch_size, shuffle=True
             ):
-                with torch.no_grad():
-                    observations = batch.observations.squeeze(1)
-                    actions = batch.actions.squeeze(1)
-                    advantages = batch.advantages.squeeze(1)
-                    returns = batch.returns.squeeze(1)
-                    old_values = batch.values.squeeze(1)
-                    old_logprobs = batch.log_probs.squeeze(1)
+                observations = batch.observations.squeeze(1)
+                actions = batch.actions.squeeze(1)
+                advantages = batch.advantages.squeeze(1)
+                returns = batch.returns.squeeze(1)
+                old_values = batch.values.squeeze(1)
+                old_logprobs = batch.log_probs.squeeze(1)
 
                 if self.args.normalize_advantages:
                     advantages = (advantages - advantages.mean()) / (
@@ -329,6 +304,17 @@ class PPO:
                 )
                 policy_loss = torch.max(policy_loss1, policy_loss2).mean()
 
+                with torch.no_grad():
+                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    old_approx_kl = (-log_ratio).mean()
+                    approx_kl = ((ratio - 1) - log_ratio).mean()
+                    clip_fracs += [
+                        ((ratio - 1.0).abs() > self.args.clip_coef)
+                        .float()
+                        .mean()
+                        .item()
+                    ]
+
                 # critic training
                 values_pred = values_pred.flatten()
                 if self.args.clip_value_loss:
@@ -345,9 +331,6 @@ class PPO:
                     critic_loss = 0.5 * torch.square(values_pred - returns).mean()
 
                 # actor learning
-
-                num_clipped += (policy_loss1 != policy_loss2).sum()
-
                 entropy_loss = entropy.mean()
                 total_loss = (
                     policy_loss
@@ -362,23 +345,27 @@ class PPO:
                 )
                 self.optim.step()
 
-                losses.append(total_loss.item())
-                actor_losses.append(policy_loss.item())
-                critic_losses.append(critic_loss.item())
-                entropy_losses.append(entropy_loss.item())
+        y_pred, y_true = (
+            self.rollout_buffer.values.cpu().numpy(),
+            self.rollout_buffer.returns.cpu().numpy(),
+        )
+        var_y = np.var(y_true)
+        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        total_losses = sum(losses) / len(losses)
-        actor_loss = sum(actor_losses) / len(actor_losses)
-        critic_loss = sum(critic_losses) / len(critic_losses)
-        entropy_loss = sum(entropy_losses) / len(entropy_losses)
-        return {
-            "loss": total_losses,
-            "loss_actor": actor_loss,
-            "loss_critic": critic_loss,
-            "loss_entropy": entropy_loss,
-            "clipfrac": num_clipped
-            / (self.args.num_epochs * self.args.num_envs * self.args.time_horizon),
-        }
+        self.logger.add_scalar(
+            "Stats/learning_rate", self.optim.param_groups[0]["lr"], self.global_step
+        )
+        self.logger.add_scalar("Loss/approx_kl", approx_kl.item(), self.global_step)
+        self.logger.add_scalar(
+            "Loss/old_approx_kl", old_approx_kl.item(), self.global_step
+        )
+        self.logger.add_scalar("Loss/clipfrac", np.mean(clip_fracs), self.global_step)
+        self.logger.add_scalar("Loss/value_loss", critic_loss.item(), self.global_step)
+        self.logger.add_scalar("Loss/actor_loss", policy_loss.item(), self.global_step)
+        self.logger.add_scalar("Loss/entropy", entropy_loss.item(), self.global_step)
+        self.logger.add_scalar(
+            "Loss/explained_variance", explained_var, self.global_step
+        )
 
 
 class Agent(nn.Module):
@@ -465,6 +452,8 @@ class Agent(nn.Module):
 if __name__ == "__main__":
     config = tyro.extras.overridable_config_cli(DEFAULT_CONFIGS)
     print(config)
+    # for k, v in vars(args).items():
+    #     print(k, ": ", v)
 
     env = make_env(config.env_id)
     env = gym.vector.SyncVectorEnv([lambda: env])
@@ -473,6 +462,6 @@ if __name__ == "__main__":
     model.train()
 
     env.close()
-    model_path = Path(f"models/{id}/ppo.pth")
-    model_path.mkdir(parents=True, exist_ok=True)
-    torch.save(model.agent.state_dict(), model_path)
+    # model_path = Path(f"models/{id}/ppo.pth")
+    # model_path.mkdir(parents=True, exist_ok=True)
+    # torch.save(model.agent.state_dict(), model_path)
